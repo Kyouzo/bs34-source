@@ -40,7 +40,7 @@ target_include_directories(bs_overlay PRIVATE
     src/overlay
 )
 target_compile_definitions(bs_overlay PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(bs_overlay PRIVATE d3d11 dxgi d3dcompiler dcomp dwmapi user32)
+target_link_libraries(bs_overlay PRIVATE d3d11 dxgi d3dcompiler dcomp dwmapi user32 ws2_32)
 
 add_executable(injector src/injector/injector.cpp)
 target_include_directories(injector PRIVATE src)

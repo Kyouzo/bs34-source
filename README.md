@@ -25,8 +25,9 @@ Offset extraction: `tools/offset_dump.py`, with SDK/header inputs under `referen
 The C++ targets require Windows, CMake and the MSVC C++20 toolchain. Python tools use repository-relative inputs; runtime probes depend on the embedded Python ABI of the examined game build.
 
 ```powershell
-cmake -S . -B build -A x64
-cmake --build build --config Release --target bs_loader bs_pyexec bs_overlay
+cmake -S . -B build -A x64 
+cmake --build build --config Release --target bs_loader bs_pyexec bs_overlay 
+cmake --build build --config Release --target pack_loader   
 ```
 
 - `src`: loader, overlay, configuration and native geometry.

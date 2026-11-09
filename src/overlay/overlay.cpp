@@ -4,6 +4,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -286,25 +288,89 @@ static bool g_imgui_ready = false;
 
 static bool g_init_failed = false;
 
-static HANDLE g_shm_state_h = nullptr;
-
-static void *g_shm_state_p = nullptr;
-
 static HANDLE g_shm_cfg_h = nullptr;
 
 static void *g_shm_cfg_p = nullptr;
 
-static void InitSharedMemory()
+static constexpr int UDP_STATE_PORT = 47200;
+static SOCKET g_udp_sock = INVALID_SOCKET;
+static CRITICAL_SECTION g_udp_cs;
+static uint8_t g_udp_buf[65536];
+static int g_udp_len = 0;
+static bool g_udp_running = false;
+static HANDLE g_udp_thread = nullptr;
+
+static DWORD WINAPI UdpRecvThread(LPVOID)
 {
-    if (!g_shm_state_h)
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+        return 0;
+
+    g_udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_udp_sock == INVALID_SOCKET)
+        return 0;
+
+    int rcv_buf = 512 * 1024;
+    setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&rcv_buf), sizeof(rcv_buf));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(UDP_STATE_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (::bind(g_udp_sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == SOCKET_ERROR)
     {
-        g_shm_state_h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 65536, "Local\\BS_IPC_STATE");
-        if (g_shm_state_h)
+        closesocket(g_udp_sock);
+        g_udp_sock = INVALID_SOCKET;
+        return 0;
+    }
+
+    while (g_udp_running)
+    {
+        char buf[65536];
+        int n = recvfrom(g_udp_sock, buf, sizeof(buf), 0, nullptr, nullptr);
+        if (n > 0)
         {
-            g_shm_state_p = MapViewOfFile(g_shm_state_h, FILE_MAP_ALL_ACCESS, 0, 0, 65536);
+            EnterCriticalSection(&g_udp_cs);
+            memcpy(g_udp_buf, buf, n);
+            g_udp_len = n;
+            LeaveCriticalSection(&g_udp_cs);
+        }
+        else
+        {
+            Sleep(1);
         }
     }
 
+    closesocket(g_udp_sock);
+    g_udp_sock = INVALID_SOCKET;
+    WSACleanup();
+    return 0;
+}
+
+static void StartUdpReceiver()
+{
+    InitializeCriticalSection(&g_udp_cs);
+    g_udp_running = true;
+    g_udp_thread = CreateThread(nullptr, 0, UdpRecvThread, nullptr, 0, nullptr);
+}
+
+static void StopUdpReceiver()
+{
+    g_udp_running = false;
+    if (g_udp_sock != INVALID_SOCKET)
+        closesocket(g_udp_sock);
+    if (g_udp_thread)
+    {
+        WaitForSingleObject(g_udp_thread, 2000);
+        CloseHandle(g_udp_thread);
+        g_udp_thread = nullptr;
+    }
+    DeleteCriticalSection(&g_udp_cs);
+}
+
+static void InitSharedMemory()
+{
     if (!g_shm_cfg_h)
     {
         g_shm_cfg_h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Cfg), "Local\\BS_IPC_CFG");
@@ -382,6 +448,8 @@ static int g_tab = 0;
 
 // Has/SetF are declared inline in bs_cfg.hpp.
 
+static FILE *g_log_file = nullptr;
+
 static void Log(const char *fmt, ...)
 {
     char msg[1024];
@@ -391,13 +459,14 @@ static void Log(const char *fmt, ...)
     va_end(ap);
     OutputDebugStringA(msg);
     OutputDebugStringA("\n");
-    FILE *f = nullptr;
-    if (_wfopen_s(&f, LogPath().c_str(), L"a") == 0 && f)
+    if (!g_log_file)
+        _wfopen_s(&g_log_file, LogPath().c_str(), L"a");
+    if (g_log_file)
     {
         SYSTEMTIME st{};
         GetLocalTime(&st);
-        fprintf(f, "%02u:%02u:%02u %s\n", st.wHour, st.wMinute, st.wSecond, msg);
-        fclose(f);
+        fprintf(g_log_file, "%02u:%02u:%02u %s\n", st.wHour, st.wMinute, st.wSecond, msg);
+        fflush(g_log_file);
     }
 }
 
@@ -453,7 +522,7 @@ static bool WriteAll(const wchar_t *path, const void *data, size_t size)
 {
     std::wstring tmp = std::wstring(path) + L".tmp";
     HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE)
         return false;
     DWORD wrote = 0;
@@ -465,7 +534,7 @@ static bool WriteAll(const wchar_t *path, const void *data, size_t size)
         return false;
     }
 
-    if (!MoveFileExW(tmp.c_str(), path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    if (!MoveFileExW(tmp.c_str(), path, MOVEFILE_REPLACE_EXISTING))
     {
         DeleteFileW(tmp.c_str());
         return false;
@@ -706,53 +775,26 @@ static void SetOptAimToggle(bool on)
 
 static bool LoadState()
 {
-    // 1. Try shared memory first (sub-microsecond memory copy, zero disk lag)
-    if (g_shm_state_p)
+    EnterCriticalSection(&g_udp_cs);
+    if (g_udp_len >= static_cast<int>(sizeof(State)))
     {
-        const State *s = reinterpret_cast<const State *>(g_shm_state_p);
-        if (s->magic == STATE_MAGIC && s->version == VERSION)
+        const State *s = reinterpret_cast<const State *>(g_udp_buf);
+        if (s->magic == STATE_MAGIC && s->version == VERSION && s->seq != g_state.seq)
         {
-            if (s->seq != g_state.seq)
+            g_state = *s;
+            uint32_t count = s->count;
+            if (count > 128)
+                count = 128;
+            size_t needed = sizeof(State) + count * sizeof(Ent);
+            if (static_cast<size_t>(g_udp_len) >= needed)
             {
-                g_state = *s;
-                uint32_t count = s->count;
-                if (count > 128)
-                    count = 128;
                 g_ents.resize(count);
                 if (count > 0)
-                {
-                    const Ent *src = reinterpret_cast<const Ent *>(reinterpret_cast<const uint8_t *>(g_shm_state_p) + sizeof(State));
-                    memcpy(g_ents.data(), src, count * sizeof(Ent));
-                }
+                    memcpy(g_ents.data(), g_udp_buf + sizeof(State), count * sizeof(Ent));
             }
-
-            return true;
         }
     }
-
-    // 2. Disk file fallback
-    if (!StateFileChanged())
-        return true;
-    if (!ReadAll(StatePath().c_str(), g_buffer) || g_buffer.size() < sizeof(State))
-        return false;
-    State s{};
-    memcpy(&s, g_buffer.data(), sizeof(s));
-    if (s.magic != STATE_MAGIC || s.version != VERSION)
-        return false;
-    size_t max_count = (g_buffer.size() - sizeof(State)) / sizeof(Ent);
-    uint32_t count = s.count;
-    if (count > max_count)
-        count = static_cast<uint32_t>(max_count);
-    if (count > 128)
-        count = 128;
-    g_state = s;
-    g_state.count = count;
-    g_ents.resize(count);
-    if (count)
-    {
-        memcpy(g_ents.data(), g_buffer.data() + sizeof(State), count * sizeof(Ent));
-    }
-
+    LeaveCriticalSection(&g_udp_cs);
     return true;
 }
 
@@ -2616,16 +2658,7 @@ static DWORD WINAPI UnloadWorker(LPVOID)
         g_device->Release();
         g_device = nullptr;
     }
-    if (g_shm_state_p)
-    {
-        UnmapViewOfFile(g_shm_state_p);
-        g_shm_state_p = nullptr;
-    }
-    if (g_shm_state_h)
-    {
-        CloseHandle(g_shm_state_h);
-        g_shm_state_h = nullptr;
-    }
+    StopUdpReceiver();
     if (g_shm_cfg_p)
     {
         UnmapViewOfFile(g_shm_cfg_p);
@@ -2676,16 +2709,7 @@ static void SafeExitCheatAndGame()
         g_device->Release();
         g_device = nullptr;
     }
-    if (g_shm_state_p)
-    {
-        UnmapViewOfFile(g_shm_state_p);
-        g_shm_state_p = nullptr;
-    }
-    if (g_shm_state_h)
-    {
-        CloseHandle(g_shm_state_h);
-        g_shm_state_h = nullptr;
-    }
+    StopUdpReceiver();
     if (g_shm_cfg_p)
     {
         UnmapViewOfFile(g_shm_cfg_p);
@@ -3263,6 +3287,7 @@ static bool InitOverlay(IDXGISwapChain *sc)
 
     EnsureWndProc();
     InitSharedMemory();
+    StartUdpReceiver();
     LoadCfg();
     EnsureWndProc();
     ApplyMenuPreferences();
@@ -3284,14 +3309,17 @@ static void RenderFrame(IDXGISwapChain *sc)
     ULONGLONG tick = GetTickCount64();
     bool menu = Has(F_MENU_OPEN);
     bool visual = menu || Has(F_ESP) || Has(F_AIM_FOV_CIRCLE);
-    ULONGLONG state_interval = visual ? 0 : 250;
-    if (tick - g_last_state_poll >= state_interval)
+    if (visual)
+    {
+        LoadState();
+    }
+    else if (tick - g_last_state_poll >= 250)
     {
         g_last_state_poll = tick;
         LoadState();
     }
 
-    if (g_cfg_dirty && tick - g_last_cfg_save >= (menu ? 60 : 250))
+    if (g_cfg_dirty && tick - g_last_cfg_save >= 2000)
     {
         g_last_cfg_save = tick;
         SaveCfg();
@@ -3370,7 +3398,6 @@ static void RenderFrame(IDXGISwapChain *sc)
     background->ChannelsSplit(2);
     background->ChannelsSetCurrent(1);
     DrawMenu();
-    EnsureWndProc();
     background->ChannelsSetCurrent(0);
     DrawESP();
     DrawFOV();
@@ -3384,11 +3411,6 @@ static void RenderFrame(IDXGISwapChain *sc)
     ImGui::Render();
     g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    if (g_cfg_dirty && tick - g_last_cfg_save >= 60)
-    {
-        g_last_cfg_save = tick;
-        SaveCfg();
-    }
 }
 
 static HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain *sc, UINT sync, UINT flags)
@@ -3548,9 +3570,34 @@ static bool InstallHook()
     return ok;
 }
 
+static HWND FindGameWindow()
+{
+    struct Ctx { HWND found; DWORD pid; };
+    Ctx ctx{nullptr, GetCurrentProcessId()};
+    EnumWindows([](HWND w, LPARAM lp) -> BOOL {
+        auto *c = reinterpret_cast<Ctx *>(lp);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (pid != c->pid) return TRUE;
+        if (!(GetWindowLongW(w, GWL_STYLE) & WS_VISIBLE)) return TRUE;
+        RECT rc{};
+        GetClientRect(w, &rc);
+        if (rc.right - rc.left < 640 || rc.bottom - rc.top < 480) return TRUE;
+        c->found = w;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found;
+}
+
 static DWORD WINAPI InitThread(LPVOID)
 {
-    Sleep(800);
+    Sleep(2000);
+    for (int i = 0; i < 120; ++i)
+    {
+        if (FindGameWindow()) break;
+        Sleep(500);
+    }
+    Sleep(3000);
     InstallHook();
     return 0;
 }

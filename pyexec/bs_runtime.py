@@ -177,7 +177,6 @@ _track_eid_t = 0.0
 _track_hold_log_t = 0.0
 _perf_t = 0.0
 _perf_last = 0.0
-_state_file_t = 0.0
 _g_log_t = 0.0
 _g_slow = 0.0
 _flick_queue = None
@@ -394,11 +393,19 @@ def _finite(*xs):
     return True
 
 
-_shm_state_p = None
+_udp_sock = None
+_UDP_ADDR = ('127.0.0.1', 47200)
 _shm_cfg_p = None
 
+def _init_udp():
+    global _udp_sock
+    if _udp_sock is not None:
+        return
+    import socket as _socket
+    _udp_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+
 def _init_ctypes_shm():
-    global _shm_state_p, _shm_cfg_p
+    global _shm_cfg_p
     try:
         import ctypes
         from ctypes import wintypes
@@ -413,13 +420,6 @@ def _init_ctypes_shm():
         PAGE_READWRITE = 0x04
         FILE_MAP_ALL_ACCESS = 0x000F001F
 
-        if _shm_state_p is None:
-            h = k32.OpenFileMappingA(FILE_MAP_ALL_ACCESS, False, b"Local\\BS_IPC_STATE")
-            if not h:
-                h = k32.CreateFileMappingA(wintypes.HANDLE(-1), None, PAGE_READWRITE, 0, 65536, b"Local\\BS_IPC_STATE")
-            if h:
-                _shm_state_p = k32.MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, 65536)
-
         if _shm_cfg_p is None:
             h = k32.OpenFileMappingA(FILE_MAP_ALL_ACCESS, False, b"Local\\BS_IPC_CFG")
             if not h:
@@ -430,30 +430,23 @@ def _init_ctypes_shm():
         pass
 
 def _write(path, data):
-    global _state_file_t
     if path == STATE_PATH:
-        if _shm_state_p is None:
-            _init_ctypes_shm()
-        if _shm_state_p:
+        _init_udp()
+        if _udp_sock is not None:
             try:
-                import ctypes
-                ctypes.memmove(_shm_state_p, data, len(data))
+                _udp_sock.sendto(data, _UDP_ADDR)
             except Exception:
                 pass
-            now = time.time()
-            if now - _state_file_t < 0.25:
-                return True
-            _state_file_t = now
+        return True
     tmp = path + '.tmp'
     try:
         with open(tmp, 'wb') as f:
             f.write(data)
-        for _ in range(4):
-            try:
-                os.replace(tmp, path)
-                return True
-            except OSError:
-                time.sleep(0.001)
+        try:
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            pass
     except Exception:
         pass
     try:
@@ -4323,6 +4316,8 @@ def _on_story_tick(dt):
     global _perf_t, _perf_last
     if int(getattr(builtins, '_m_generation', 0) or 0) != _my_gen:
         return
+    if not _hooks_done:
+        _install_hooks()
     try:
         t0 = time.time()
         cfg = _read_cfg()
@@ -4332,13 +4327,13 @@ def _on_story_tick(dt):
         if dt > 0.4 and now - _perf_t >= 1.0:
             _perf_t = now
             _sys_log('perf stutter dtime=%.3f' % (dt,))
-        if now - _last_hooks >= 2.0:
+        if now - _last_hooks >= 15.0:
             _last_hooks = now
             _install_instance_hooks()
-        if now - _last_scrub >= 60.0:
+        if now - _last_scrub >= 300.0:
             _last_scrub = now
             _scrub_disk_markers()
-        if now - _last_catalog_check >= 5.0:
+        if now - _last_catalog_check >= 120.0:
             _last_catalog_check = now
             _save_template_cache()
         if _fire_release_at and now >= _fire_release_at:
@@ -4349,31 +4344,29 @@ def _on_story_tick(dt):
         in_match = not bool(getattr(genv, 'is_in_hall', True))
         _sync_ray_interceptor(cfg, in_match)
         _apply(cfg)
-        _sync_configured_appearance(cfg)
-        _dispatch_appearance_queue()
-        t_apply = time.time()
+        if now - getattr(_sync_configured_appearance, '_t', 0.0) >= 1.0:
+            _sync_configured_appearance._t = now
+            _sync_configured_appearance(cfg)
+            _dispatch_appearance_queue()
         if _flag(cfg, F_UNLOCK_EFFECTS):
             _refresh_runtime_cosmetics()
         if _flag(cfg, F_FORCE_KILLFX):
             _force_killfx_on_equipped()
-        t_unlock = time.time()
         cam = None
         origin = None
         items = []
+        fresh_gather = False
         track_active = _flag(cfg, F_TRACK_VIEW)
         render_on = _flag(cfg, F_RENDER_ENTITIES)
         if in_match and (track_active or render_on):
             scan = max(float(cfg[IDX_RENDER_MAX_DIST]), float(cfg[IDX_TRACK_MAX_DIST]))
-            interval = 0.0
             want_gun = render_on and _flag(cfg, F_RENDER_EQUIPMENT)
             want_bone = render_on and _flag(cfg, F_RENDER_SKELETON)
-            if now - _last_gather >= interval or _gather_cache[1] is None:
-                cam, origin, items = _query_visible_entities(scan, want_gun, want_bone)
-                _gather_cache = (now, cam, origin, items)
-                _last_gather = now
-            else:
-                _, cam, origin, items = _gather_cache
-            if render_on and now - _diag_t >= 5.0:
+            cam, origin, items = _query_visible_entities(scan, want_gun, want_bone)
+            _gather_cache = (now, cam, origin, items)
+            _last_gather = now
+            fresh_gather = True
+            if render_on and now - _diag_t >= 120.0:
                 _diag_t = now
                 try:
                     total = len(_collect_space_entities(getattr(genv, 'space', None)))
@@ -4402,33 +4395,26 @@ def _on_story_tick(dt):
                 cam = None
                 origin = None
             _gather_cache = (now, cam, origin, [])
+            fresh_gather = True
         if items and track_active:
-            t_gather = time.time()
             _update_cam_trajectory(cfg, items, cam, origin, menu_open, dt)
         else:
-            t_gather = time.time()
             _track_busy = False
-        t_track = time.time()
         _sync_impulse_damping(cfg, in_match)
         _sync_weapon_case_damping(cfg, in_match)
-        _last_state = now
-        av, lid, team, lpos = _local()
-        buf = _serialize_frame_data(cfg, cam, in_match, origin, lpos, items)
-        if buf is not None:
-            _write(STATE_PATH, buf)
-        t1 = time.time()
-        total = t1 - t0
-        if (total > 0.06 or t_track - t_gather > 0.04) and t0 - _perf_last >= 1.0:
-            _perf_last = t0
-            _sys_log('[sys:perf] dt=%.3f total=%.3f apply=%.4f unlock=%.4f gather=%.4f track=%.4f state=%.4f items=%d' % (
-                dt, total, t_apply - t0, t_unlock - t_apply, t_gather - t_unlock,
-                t_track - t_gather, t1 - t_track, len(items)))
+        if fresh_gather:
+            _last_state = now
+            av, lid, team, lpos = _local()
+            buf = _serialize_frame_data(cfg, cam, in_match, origin, lpos, items)
+            if buf is not None:
+                _write(STATE_PATH, buf)
     except Exception:
         _sys_log(traceback.format_exc())
 
 
 _on_story_tick.__name__ = 'OnEngineViewportUpdate'
 _on_story_tick.__qualname__ = 'OnEngineViewportUpdate'
+
 
 
 def start():
@@ -4439,7 +4425,6 @@ def start():
     os.makedirs(IPC_DIR, exist_ok=True)
     _make_cfg_default()
     _save_template_cache()
-    _install_hooks()
     try:
         import gclient.framework.util.story_tick as st
         def OnEngineViewportUpdate(dt):
@@ -4452,13 +4437,6 @@ def start():
         return False
     _booted = True
     _last_apply_seq = -1
-    try:
-        cfg = _read_cfg()
-        cam, origin, items = _query_visible_entities(float(cfg[IDX_RENDER_MAX_DIST]))
-        av, lid, team, lpos = _local()
-        _write(STATE_PATH, _serialize_frame_data(cfg, cam, not bool(getattr(genv, 'is_in_hall', True)), origin, lpos, items))
-    except Exception:
-        _sys_log(traceback.format_exc())
     return True
 
 

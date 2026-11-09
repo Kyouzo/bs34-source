@@ -114,6 +114,15 @@ DWORD WINAPI Worker(LPVOID) {
     auto release = reinterpret_cast<PyGILStateReleaseFn>(reinterpret_cast<uintptr_t>(game) + kPyGILStateRelease);
     auto run = reinterpret_cast<PyRunSimpleStringFlagsFn>(reinterpret_cast<uintptr_t>(game) + kPyRunSimpleStringFlags);
 
+    Sleep(2000);
+    for (int i = 0; i < 120; ++i) {
+        int st = ensure();
+        int ok = run("import gclient.framework.util.story_tick", nullptr);
+        release(st);
+        if (ok == 0) break;
+        Sleep(500);
+    }
+
     std::string runner = BuildRunner();
     bool exists = false;
     FILETIME last = LastWrite(g_cmd.c_str(), exists);
