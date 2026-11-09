@@ -3459,6 +3459,15 @@ def _resolve_visual_descriptor(info, caster_id=None, weapon_hint=None):
     return result
 
 
+_VISUAL_ATTR_TEMPLATE_KEYS = {
+    'bullet_trace': ('fps_tracer_bullet_id', 'fps_adstracer_bullet_id', 'tps_tracer_bullet_id',
+                     'fps_simple_tracer_bullet_id', 'extra_ballistic_tracer_bullet_id'),
+    'hit_effect': ('skin_hit_object_effect_id',),
+    'kill_effect': ('skin_kill_effect_id', 'kill_avatar_effect_id', 'fps_kill_effect_id',
+                    'skin_dead_effect_id'),
+}
+
+
 def _proxy_visual_attribute(original, field):
     def getter(case):
         binding = getattr(case, '_m_fx_meta', None)
@@ -3469,9 +3478,10 @@ def _proxy_visual_attribute(original, field):
             templates = sys.modules.get('gclient.data.gun_skin_template_data')
             feature = getattr(features, 'data', {}).get(binding['item_id']) or {}
             template = getattr(templates, 'data', {}).get(binding['template_id']) or {}
-            keys = ('fps_tracer_bullet_id', 'fps_adstracer_bullet_id', 'tps_tracer_bullet_id',
-                    'fps_simple_tracer_bullet_id', 'extra_ballistic_tracer_bullet_id') if field == 'bullet_trace' else ('skin_hit_object_effect_id',)
-            return bool(feature.get(field) and any(template.get(k) for k in keys))
+            keys = _VISUAL_ATTR_TEMPLATE_KEYS.get(field, ())
+            if keys:
+                return bool(feature.get(field) and any(template.get(k) for k in keys))
+            return bool(feature.get(field))
         return original(case)
     getter.__name__ = original.__name__
     getter._m_fx_orig = original
@@ -3528,7 +3538,8 @@ def _install_visual_proxies():
     module = sys.modules.get('gclient.gameplay.logic_base.equips.weapon_case_base')
     cls = getattr(module, 'WeaponCaseBase', None)
     if cls is not None:
-        for name, field in (('show_guise_bullet_trace', 'bullet_trace'), ('show_guise_hit_effect', 'hit_effect')):
+        for name, field in (('show_guise_bullet_trace', 'bullet_trace'), ('show_guise_hit_effect', 'hit_effect'),
+                             ('show_guise_kill_effect', 'kill_effect')):
             descriptor = vars(cls).get(name)
             current = getattr(descriptor, 'func', None)
             if callable(current) and getattr(current, '_m_fx_owner', None) is not globals():
@@ -4087,9 +4098,9 @@ def _killfx_build_family_best(rows):
             continue
         q = int(proto.get('quality') or 0)
         key = _killfx_family_key(proto)
-        slot = best.setdefault(key, {'quality': 0, 'kill_hud_id': 0, 'hit_effect': 0, 'trail_effect': 0, 'template_id': 0})
+        slot = best.setdefault(key, {'quality': 0, 'kill_hud_id': 0, 'hit_effect': 0, 'trail_effect': 0, 'kill_effect': 0, 'template_id': 0})
         template = int((proto.get('guise') or {}).get('template_id') or 0)
-        for field in ('kill_hud_id', 'hit_effect', 'trail_effect'):
+        for field in ('kill_hud_id', 'hit_effect', 'trail_effect', 'kill_effect'):
             v = proto.get(field)
             if v and (not slot[field] or q >= slot['quality']):
                 slot[field] = int(v)
@@ -4143,7 +4154,7 @@ def _killfx_patch_catalog_step(rows, best, budget=0.002):
             slot = best.get(_killfx_family_key(proto))
             if not slot:
                 continue
-            for field in ('kill_hud_id', 'hit_effect', 'trail_effect'):
+            for field in ('kill_hud_id', 'hit_effect', 'trail_effect', 'kill_effect'):
                 v = slot[field]
                 if v and not proto.get(field):
                     proto[field] = v
@@ -4204,7 +4215,7 @@ def _force_killfx_on_equipped():
             slot = best.get(_killfx_family_key(proto))
             if not slot:
                 continue
-            for field in ('kill_hud_id', 'hit_effect', 'trail_effect'):
+            for field in ('kill_hud_id', 'hit_effect', 'trail_effect', 'kill_effect'):
                 v = slot[field]
                 if v and proto.get(field) != v:
                     proto[field] = v
