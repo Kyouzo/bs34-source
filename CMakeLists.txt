@@ -6,18 +6,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-add_library(bs_test SHARED src/test_dll.cpp)
+add_library(bs_test SHARED src/test/test_dll.cpp)
 target_compile_definitions(bs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(bs_test PRIVATE user32)
 
-add_library(bs_pyexec SHARED src/pyexec.cpp)
+add_library(bs_pyexec SHARED src/pyexec/pyexec.cpp)
+target_include_directories(bs_pyexec PRIVATE src)
 target_compile_definitions(bs_pyexec PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui-master")
 set(MINHOOK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/minhook-master")
 
 add_library(bs_overlay SHARED
-    src/overlay.cpp
+    src/overlay/overlay.cpp
     "${IMGUI_DIR}/imgui.cpp"
     "${IMGUI_DIR}/imgui_draw.cpp"
     "${IMGUI_DIR}/imgui_tables.cpp"
@@ -36,11 +37,13 @@ target_include_directories(bs_overlay PRIVATE
     "${MINHOOK_DIR}/src"
     "${MINHOOK_DIR}/src/hde"
     src
+    src/overlay
 )
 target_compile_definitions(bs_overlay PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(bs_overlay PRIVATE d3d11 dxgi d3dcompiler dcomp dwmapi user32)
 
-add_executable(injector src/injector.cpp)
+add_executable(injector src/injector/injector.cpp)
+target_include_directories(injector PRIVATE src)
 target_compile_definitions(injector PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(injector PRIVATE user32 advapi32)
 set_target_properties(injector PROPERTIES LINK_FLAGS "/MANIFEST:EMBED /MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"")
@@ -59,7 +62,7 @@ set(CIYE_DIST_DIR "${CMAKE_SOURCE_DIR}/dist" CACHE PATH "Single output folder fo
 enable_language(RC)
 
 add_executable(bs_loader WIN32
-    src/loader.cpp
+    src/loader/loader.cpp
     "${IMGUI_DIR}/imgui.cpp"
     "${IMGUI_DIR}/imgui_draw.cpp"
     "${IMGUI_DIR}/imgui_tables.cpp"
@@ -68,7 +71,7 @@ add_executable(bs_loader WIN32
     "${IMGUI_DIR}/backends/imgui_impl_win32.cpp"
     resources/app.rc
 )
-target_include_directories(bs_loader PRIVATE "${IMGUI_DIR}" "${IMGUI_DIR}/backends" src)
+target_include_directories(bs_loader PRIVATE "${IMGUI_DIR}" "${IMGUI_DIR}/backends" src src/loader)
 target_compile_definitions(bs_loader PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(bs_loader PRIVATE d3d11 dxgi dwmapi shell32 advapi32 user32)
 set_target_properties(bs_loader PROPERTIES
@@ -83,7 +86,7 @@ set_target_properties(bs_loader PROPERTIES
 option(BS_LOADER_PREVIEW "Build a non-elevated preview of the loader for UI testing" OFF)
 if(BS_LOADER_PREVIEW)
     add_executable(bs_loader_preview WIN32
-        src/loader.cpp
+        src/loader/loader.cpp
         "${IMGUI_DIR}/imgui.cpp"
         "${IMGUI_DIR}/imgui_draw.cpp"
         "${IMGUI_DIR}/imgui_tables.cpp"
@@ -92,7 +95,7 @@ if(BS_LOADER_PREVIEW)
         "${IMGUI_DIR}/backends/imgui_impl_win32.cpp"
         resources/app.rc
     )
-    target_include_directories(bs_loader_preview PRIVATE "${IMGUI_DIR}" "${IMGUI_DIR}/backends" src)
+    target_include_directories(bs_loader_preview PRIVATE "${IMGUI_DIR}" "${IMGUI_DIR}/backends" src src/loader)
     target_compile_definitions(bs_loader_preview PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(bs_loader_preview PRIVATE d3d11 dxgi dwmapi shell32 advapi32 user32)
     set_target_properties(bs_loader_preview PROPERTIES WIN32_EXECUTABLE TRUE)
@@ -131,7 +134,7 @@ endif()
 option(BS_MENU_PREVIEW "Build the isolated ImGui menu renderer" OFF)
 if(BS_MENU_PREVIEW)
     get_target_property(MENU_PREVIEW_SOURCES bs_overlay SOURCES)
-    list(REMOVE_ITEM MENU_PREVIEW_SOURCES src/overlay.cpp)
+    list(REMOVE_ITEM MENU_PREVIEW_SOURCES src/overlay/overlay.cpp)
     add_executable(bs_menu_preview tools/menu_preview.cpp ${MENU_PREVIEW_SOURCES})
     get_target_property(MENU_PREVIEW_INCLUDES bs_overlay INCLUDE_DIRECTORIES)
     target_include_directories(bs_menu_preview PRIVATE ${MENU_PREVIEW_INCLUDES})

@@ -2,10 +2,12 @@
 #include <cstdint>
 #include <string>
 
+#include "common/root_hint.hpp"
+
 namespace {
-constexpr uintptr_t kPyGILStateEnsure = 0x2ADC1C0;
-constexpr uintptr_t kPyGILStateRelease = 0x2ADC290;
-constexpr uintptr_t kPyRunSimpleStringFlags = 0x2A9DEE0;
+constexpr uintptr_t kPyGILStateEnsure = 0x2ADC1C0; // 48 89 5C 24 ? 57 48 83 EC ? 48 8D 0D ? ? ? ? E8 ? ? ? ? 48 8B D8 48 85 C0 75
+constexpr uintptr_t kPyGILStateRelease = 0x2ADC290; // 48 89 5C 24 ? 57 48 83 EC ? 8B F9 48 8D 0D ? ? ? ? E8
+constexpr uintptr_t kPyRunSimpleStringFlags = 0x2A9DEE0; // 48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B F1 48 8B DA 48 8D 0D
 
 std::wstring g_root;
 std::wstring g_cmd;
@@ -22,26 +24,11 @@ std::string ToUtf8(const std::wstring& s) {
 }
 
 bool ReadRootHint(std::wstring& root) {
-    wchar_t tmp[MAX_PATH]{};
-    if (!GetTempPathW(MAX_PATH, tmp)) return false;
-    std::wstring path = std::wstring(tmp) + L"CiyE_BSLoader\\root.txt";
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    DWORD size = GetFileSize(h, nullptr);
-    if (size < 2 || size > 4096) {
-        CloseHandle(h);
+    std::wstring hint;
+    if (!ipc::ReadRootHint(hint)) return false;
+    if (GetFileAttributesW((hint + L"\\pyexec\\cmd.py").c_str()) == INVALID_FILE_ATTRIBUTES)
         return false;
-    }
-    std::wstring buf(size / sizeof(wchar_t), L'\0');
-    DWORD read = 0;
-    BOOL ok = ReadFile(h, &buf[0], size, &read, nullptr);
-    CloseHandle(h);
-    if (!ok || read < 2) return false;
-    buf.resize(read / sizeof(wchar_t));
-    if (GetFileAttributesW((buf + L"\\pyexec\\cmd.py").c_str()) == INVALID_FILE_ATTRIBUTES)
-        return false;
-    root = buf;
+    root = hint;
     return true;
 }
 
