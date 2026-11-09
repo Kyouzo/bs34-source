@@ -1773,21 +1773,28 @@ static void DrawESP()
         float y = hy - (esp_font_sz + 6.0f);
         if (is_knocked)
         {
-            y -= chip(cx, y, "[KNOCKED]", IM_COL32(255, 175, 45, 255));
+            const char *ks = "[KNOCKED]";
+            ImVec2 ksz = calc_sz(ks);
+            txt(ImVec2(cx - ksz.x * 0.5f, y), IM_COL32(255, 175, 45, 255), ks);
+            y -= ksz.y + 2.0f;
         }
         if (Has(F_ESP_NAME) && e.name[0])
         {
-            y -= chip(cx, y, e.name, g_cfg.col_name);
+            const char *dname = e.is_monster ? "BOT" : e.name;
+            ImVec2 nsz = calc_sz(dname);
+            txt(ImVec2(cx - nsz.x * 0.5f, y), hidden ? g_cfg.col_box_hidden : g_cfg.col_name, dname);
+            y -= nsz.y + 2.0f;
         }
         if (Has(F_ESP_GUN) && e.gun[0])
         {
-            y -= chip(cx, y, e.gun, g_cfg.col_gun);
+            y -= chip(cx, y, e.gun, hidden ? g_cfg.col_box_hidden : g_cfg.col_gun);
         }
         if (Has(F_ESP_DISTANCE))
         {
             char dbuf[24];
             snprintf(dbuf, sizeof(dbuf), "%.0f m", e.distance);
-            chip(cx, fy + 6.0f, dbuf, g_cfg.col_dist);
+            ImVec2 dsz = calc_sz(dbuf);
+            txt(ImVec2(cx - dsz.x * 0.5f, fy + 6.0f), hidden ? g_cfg.col_box_hidden : g_cfg.col_dist, dbuf);
         }
 
         bool has_hp = Has(F_ESP_HEALTH) && e.max_hp > 0.0f;
@@ -1818,13 +1825,6 @@ static void DrawESP()
             {
                 dl->AddRectFilled(ImVec2(bx, top), ImVec2(bx + bar_w, fy), fg, 1.5f);
             }
-            // Tick marks at 25 / 50 / 75 %
-            ImU32 tick = IM_COL32(0, 0, 0, 150);
-            for (int i = 1; i < 4; ++i)
-            {
-                float ty = hy + h * (i / 4.0f);
-                dl->AddLine(ImVec2(bx, ty), ImVec2(bx + bar_w, ty), tick, 1.0f);
-            }
             // Numeric readout for HP when the box is tall enough and HP is low (<=60%).
             // Sharp chip + skip readout entirely for distant/tiny targets.
             if (!is_armor && !is_knocked && h >= 36.0f && ratio <= 0.60f)
@@ -1845,7 +1845,16 @@ static void DrawESP()
         if (has_hp)
         {
             float ratio = e.hp / e.max_hp;
-            ImU32 hp_color = is_knocked ? IM_COL32(255, 140, 0, 245) : (ratio > 0.60f ? g_cfg.col_health : (ratio > 0.25f ? IM_COL32(245, 215, 60, 245) : IM_COL32(245, 60, 60, 245)));
+            ImU32 hp_color;
+            if (is_knocked) {
+                hp_color = IM_COL32(255, 140, 0, 245);
+            } else {
+                float t = ratio < 0.0f ? 0.0f : (ratio > 1.0f ? 1.0f : ratio);
+                uint8_t cr, cg;
+                if (t > 0.5f) { cr = (uint8_t)(255.0f * (1.0f - (t - 0.5f) * 2.0f)); cg = 255; }
+                else           { cr = 255; cg = (uint8_t)(255.0f * t * 2.0f); }
+                hp_color = IM_COL32(cr, cg, 30, 245);
+            }
             draw_bar(first_x, ratio, hp_color, false);
         }
         if (has_armor)

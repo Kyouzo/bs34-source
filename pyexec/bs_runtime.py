@@ -3158,7 +3158,6 @@ def _update_cam_trajectory(cfg, items, cam, origin, menu_open, dt=0.0166667):
     _track_prev = track_down
     if menu_open:
         track_on = False
-        _track_latched = False
         _path = None
     _track_busy = track_on
     if cam is None or origin is None:
